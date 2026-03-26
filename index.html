@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MGRS Map with Drawing Tools</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+
+        #map { width: 100%; height: 100vh; }
+
+        #mgrs-display {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.92);
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+        #mgrs-display span { font-weight: 600; }
+
+        #measurements-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 14px 18px;
+            border-radius: 8px;
+            font-size: 13px;
+            max-width: 340px;
+            max-height: 60vh;
+            overflow-y: auto;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+        }
+        #measurements-panel h3 {
+            margin-bottom: 8px;
+            font-size: 15px;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 6px;
+        }
+        .measurement-item {
+            padding: 8px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .measurement-item:last-child { border-bottom: none; }
+        .measurement-item .label {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 2px;
+        }
+        .measurement-item .detail {
+            color: #555;
+            font-size: 12px;
+            line-height: 1.5;
+        }
+        .measurement-item .mgrs-coord {
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 11px;
+            color: #0066cc;
+        }
+        .no-shapes { color: #999; font-style: italic; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="mgrs-display">MGRS: <span id="mgrs-coord">Move mouse over map</span></div>
+    <div id="measurements-panel">
+        <h3>Measurements</h3>
+        <div id="measurements-list"><p class="no-shapes">Draw shapes to see measurements</p></div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+    <script>
+    // ── MGRS conversion (WGS84 ↔ MGRS) ──────────────────────────────────
+    const MGRS = (() => {
+        const DEG = Math.PI / 180;
+        const a = 6378137;               // WGS84 semi-major
+        const f = 1 / 298.257223563;
+        const e2 = 2 * f - f * f;
+        const e = Math.sqrt(e2);
+        const e_prime2 = e2 / (1 - e2);
+        const k0 = 0.9996;
+
+        const LETTERS_100K_SET_1 = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+        const LETTERS_100K_SET_2 = 'FGHJKLMNPQRSTUVABCDE';
+
+        function latLonToUtm(lat, lon) {
+            const latRad = lat * DEG;
+            const lonRad = lon * DEG;
+
+            let zoneNum = Math.floor((lon + 180) / 6) + 1;
+            // Special zones for Norway / Svalbard
+            if (lat >= 56 && lat < 64 && lon >= 3 && lon < 12) zoneNum = 32;
+            if (lat >= 72 && lat < 84) {
+                if (lon >= 0 && lon < 9) zoneNum = 31;
+                else if (lon >= 9 && lon < 21) zoneNum = 33;
+                else if (lon >= 21 && lon < 33) zoneNum = 35;
+                else if (lon >= 33 && lon < 42) zoneNum = 37;
+            }
+
+            const lonOrigin = (zoneNum - 1) * 6 - 180 + 3;
+            const lonOriginRad = lonOrigin * DEG;
+
+            const N = a / Math.sqrt(1 - e2 * Math.sin(latRad) ** 2);
+            const T = Math.tan(latRad) ** 2;
+            const C = e_prime2 * Math.cos(latRad) ** 2;
+            const A = Math.cos(latRad) * (lonRad - lonOriginRad);
+
+            const M = a * (
+                (1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256) * latRad
+                - (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * Math.sin(2 * latRad)
+                + (15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024) * Math.sin(4 * latRad)
+                - (35 * e2 ** 3 / 3072) * Math.sin(6 * latRad)
+            );
+
+            let easting = k0 * N * (A + (1 - T + C) * A ** 3 / 6
+                + (5 - 18 * T + T ** 2 + 72 * C - 58 * e_prime2) * A ** 5 / 120) + 500000;
+
+            let northing = k0 * (M + N * Math.tan(latRad) * (
+                A ** 2 / 2 + (5 - T + 9 * C + 4 * C ** 2) * A ** 4 / 24
+                + (61 - 58 * T + T ** 2 + 600 * C - 330 * e_prime2) * A ** 6 / 720
+            ));
+
+            if (lat < 0) northing += 10000000;
+
+            return { zoneNum, easting, northing };
+        }
+
+        function getLetterDesignator(lat) {
+            const letters = 'CDEFGHJKLMNPQRSTUVWX';
+            if (lat >= -80 && lat <= 84) {
+                const idx = Math.floor((lat + 80) / 8);
+                return letters[Math.min(idx, letters.length - 1)];
+            }
+            return 'Z';
+        }
+
+        function get100kId(easting, northing, zoneNum) {
+            const set = ((zoneNum - 1) % 6);
+            const col = Math.floor(easting / 100000) - 1;
+            const row = Math.floor(northing % 2000000 / 100000);
+
+            const colLetters = [
+                'ABCDEFGH', 'JKLMNPQR', 'STUVWXYZ',
+                'ABCDEFGH', 'JKLMNPQR', 'STUVWXYZ'
+            ];
+            const rowLetters = [
+                'ABCDEFGHJKLMNPQRSTUV',
+                'FGHJKLMNPQRSTUVABCDE'
+            ];
+
+            const colLetter = colLetters[set][col];
+            const rowLetter = rowLetters[set % 2][row];
+            return colLetter + rowLetter;
+        }
+
+        function forward(lat, lon, precision) {
+            precision = precision || 5;
+            if (lat < -80 || lat > 84) return 'Outside MGRS range';
+
+            const { zoneNum, easting, northing } = latLonToUtm(lat, lon);
+            const zoneLetter = getLetterDesignator(lat);
+            const id100k = get100kId(easting, northing, zoneNum);
+
+            const e100k = easting % 100000;
+            const n100k = northing % 100000;
+
+            const divisor = Math.pow(10, 5 - precision);
+            const eStr = String(Math.floor(e100k / divisor)).padStart(precision, '0');
+            const nStr = String(Math.floor(n100k / divisor)).padStart(precision, '0');
+
+            return `${zoneNum}${zoneLetter} ${id100k} ${eStr} ${nStr}`;
+        }
+
+        return { forward };
+    })();
+
+    // ── Map setup ────────────────────────────────────────────────────────
+    const map = L.map('map').setView([61.5, 24.0], 6);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+        maxZoom: 19
+    }).addTo(map);
+
+    // ── Drawing layer ────────────────────────────────────────────────────
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+
+    const drawControl = new L.Control.Draw({
+        position: 'topleft',
+        draw: {
+            polygon: {
+                allowIntersection: false,
+                shapeOptions: { color: '#e63946', weight: 2, fillOpacity: 0.15 }
+            },
+            circle: {
+                shapeOptions: { color: '#457b9d', weight: 2, fillOpacity: 0.15 }
+            },
+            polyline: {
+                shapeOptions: { color: '#2a9d8f', weight: 3 }
+            },
+            marker: true,
+            circlemarker: false,
+            rectangle: {
+                shapeOptions: { color: '#e9c46a', weight: 2, fillOpacity: 0.15 }
+            }
+        },
+        edit: {
+            featureGroup: drawnItems,
+            remove: true
+        }
+    });
+    map.addControl(drawControl);
+
+    // ── MGRS cursor display ──────────────────────────────────────────────
+    const mgrsCoordEl = document.getElementById('mgrs-coord');
+    map.on('mousemove', (e) => {
+        const { lat, lng } = e.latlng;
+        mgrsCoordEl.textContent = MGRS.forward(lat, lng, 5);
+    });
+
+    // ── Haversine distance (metres) ──────────────────────────────────────
+    function haversine(p1, p2) {
+        const R = 6371000;
+        const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+        const dLon = (p2.lng - p1.lng) * Math.PI / 180;
+        const a = Math.sin(dLat / 2) ** 2
+            + Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180)
+            * Math.sin(dLon / 2) ** 2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    function formatDist(m) {
+        return m >= 1000 ? (m / 1000).toFixed(3) + ' km' : m.toFixed(1) + ' m';
+    }
+
+    function formatArea(sqm) {
+        if (sqm >= 1e6) return (sqm / 1e6).toFixed(4) + ' km\u00B2';
+        if (sqm >= 1e4) return (sqm / 1e4).toFixed(4) + ' ha';
+        return sqm.toFixed(1) + ' m\u00B2';
+    }
+
+    // ── Geodesic polygon area (Shoelace on metre-projected coords) ─────
+    function polygonAreaMetres(latlngs) {
+        const n = latlngs.length;
+        if (n < 3) return 0;
+        // Project to metres relative to centroid
+        const cLat = latlngs.reduce((s, p) => s + p.lat, 0) / n;
+        const cLng = latlngs.reduce((s, p) => s + p.lng, 0) / n;
+        const toRad = Math.PI / 180;
+        const mPerDegLat = 111320;
+        const mPerDegLng = 111320 * Math.cos(cLat * toRad);
+        const projected = latlngs.map(p => ({
+            x: (p.lng - cLng) * mPerDegLng,
+            y: (p.lat - cLat) * mPerDegLat
+        }));
+        // Shoelace formula
+        let sum = 0;
+        for (let i = 0; i < n; i++) {
+            const j = (i + 1) % n;
+            sum += projected[i].x * projected[j].y - projected[j].x * projected[i].y;
+        }
+        return Math.abs(sum) / 2;
+    }
+
+    // ── Measurement logic ────────────────────────────────────────────────
+    let shapeCounter = 0;
+
+    function updateMeasurements() {
+        const list = document.getElementById('measurements-list');
+        const layers = [];
+        drawnItems.eachLayer(l => layers.push(l));
+
+        if (layers.length === 0) {
+            list.innerHTML = '<p class="no-shapes">Draw shapes to see measurements</p>';
+            return;
+        }
+
+        list.innerHTML = '';
+        layers.forEach(layer => {
+            const item = document.createElement('div');
+            item.className = 'measurement-item';
+
+            if (layer instanceof L.Circle) {
+                const center = layer.getLatLng();
+                const radius = layer.getRadius();
+                const diameter = radius * 2;
+                const circumference = 2 * Math.PI * radius;
+                const area = Math.PI * radius * radius;
+                const mgrs = MGRS.forward(center.lat, center.lng, 5);
+
+                item.innerHTML = `
+                    <div class="label">Circle #${layer._shapeId}</div>
+                    <div class="detail">
+                        Center (MGRS): <span class="mgrs-coord">${mgrs}</span><br>
+                        Radius: ${formatDist(radius)}<br>
+                        Diameter: ${formatDist(diameter)}<br>
+                        Circumference: ${formatDist(circumference)}<br>
+                        Area: ${formatArea(area)}
+                    </div>`;
+            } else if (layer instanceof L.Polygon) {
+                const latlngs = layer.getLatLngs()[0];
+                const n = latlngs.length;
+                const name = n === 3 ? 'Triangle' : n === 4 ? 'Rectangle' : `Polygon (${n} sides)`;
+
+                let perimeterHtml = '';
+                let totalPerimeter = 0;
+                for (let i = 0; i < n; i++) {
+                    const p1 = latlngs[i];
+                    const p2 = latlngs[(i + 1) % n];
+                    const d = haversine(p1, p2);
+                    totalPerimeter += d;
+                    const m1 = MGRS.forward(p1.lat, p1.lng, 5);
+                    perimeterHtml += `  Side ${i + 1}: ${formatDist(d)}<br>`;
+                }
+
+                // Vertices in MGRS
+                let verticesHtml = '';
+                latlngs.forEach((v, i) => {
+                    verticesHtml += `  V${i + 1}: <span class="mgrs-coord">${MGRS.forward(v.lat, v.lng, 5)}</span><br>`;
+                });
+
+                // Area via Shoelace on metre-projected coordinates
+                const area = polygonAreaMetres(latlngs);
+
+                // Compute longest diagonal (for triangles this is the longest side)
+                let longestDiag = 0;
+                for (let i = 0; i < n; i++) {
+                    for (let j = i + 1; j < n; j++) {
+                        const d = haversine(latlngs[i], latlngs[j]);
+                        if (d > longestDiag) longestDiag = d;
+                    }
+                }
+
+                item.innerHTML = `
+                    <div class="label">${name} #${layer._shapeId}</div>
+                    <div class="detail">
+                        <strong>Vertices (MGRS):</strong><br>${verticesHtml}
+                        <strong>Side lengths:</strong><br>${perimeterHtml}
+                        Total perimeter: ${formatDist(totalPerimeter)}<br>
+                        Longest diagonal: ${formatDist(longestDiag)}<br>
+                        Area: ${formatArea(area)}
+                    </div>`;
+            } else if (layer instanceof L.Polyline) {
+                const latlngs = layer.getLatLngs();
+                let totalLen = 0;
+                let segHtml = '';
+                for (let i = 0; i < latlngs.length - 1; i++) {
+                    const d = haversine(latlngs[i], latlngs[i + 1]);
+                    totalLen += d;
+                    segHtml += `  Seg ${i + 1}: ${formatDist(d)}<br>`;
+                }
+                let verticesHtml = '';
+                latlngs.forEach((v, i) => {
+                    verticesHtml += `  P${i + 1}: <span class="mgrs-coord">${MGRS.forward(v.lat, v.lng, 5)}</span><br>`;
+                });
+
+                item.innerHTML = `
+                    <div class="label">Line #${layer._shapeId}</div>
+                    <div class="detail">
+                        <strong>Points (MGRS):</strong><br>${verticesHtml}
+                        <strong>Segments:</strong><br>${segHtml}
+                        Total length: ${formatDist(totalLen)}
+                    </div>`;
+            } else if (layer instanceof L.Marker) {
+                const pos = layer.getLatLng();
+                const mgrs = MGRS.forward(pos.lat, pos.lng, 5);
+                item.innerHTML = `
+                    <div class="label">Marker #${layer._shapeId}</div>
+                    <div class="detail">
+                        MGRS: <span class="mgrs-coord">${mgrs}</span><br>
+                        Lat: ${pos.lat.toFixed(6)}, Lon: ${pos.lng.toFixed(6)}
+                    </div>`;
+            }
+
+            list.appendChild(item);
+        });
+    }
+
+    // ── Draw events ──────────────────────────────────────────────────────
+    map.on(L.Draw.Event.CREATED, (e) => {
+        const layer = e.layer;
+        layer._shapeId = ++shapeCounter;
+        drawnItems.addLayer(layer);
+        updateMeasurements();
+    });
+
+    map.on(L.Draw.Event.EDITED, () => updateMeasurements());
+    map.on(L.Draw.Event.DELETED, () => updateMeasurements());
+
+    </script>
+</body>
+</html>
